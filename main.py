@@ -1,19 +1,21 @@
-import asyncio
-import logging
 import os
-import re
-import shutil
-import signal
-import sqlite3
-import subprocess
 import sys
 import time
-import venv
-
+import asyncio
+import logging
+import signal
 from pathlib import Path
-from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import pexpect
+from aiohttp import web
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -21,1597 +23,1175 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    ConversationHandler,
     filters,
 )
 
 # =========================================================
-# SETTINGS
+# CONFIG
 # =========================================================
 
-# यहां अपने Manager Bot का नया token डालें
-MANAGER_BOT_TOKEN = "8400765415:AAEHYxy2k8xBdr2nvy8Y0H894C3__bBfKM0"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID_TEXT = os.getenv("ADMIN_ID", "").strip()
 
-# यहां अपना Telegram numeric user ID डालें
-ADMIN_ID = 8209524871
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN missing")
+
+if not ADMIN_ID_TEXT.isdigit():
+    raise RuntimeError("ADMIN_ID must be numeric")
+
+ADMIN_ID = int(ADMIN_ID_TEXT)
+
+PORT = int(os.getenv("PORT", "10000"))
 
 BASE_DIR = Path(__file__).resolve().parent
-BOTS_DIR = BASE_DIR / "uploaded_bots"
-DATABASE_FILE = BASE_DIR / "hosting_manager.db"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "storage")))
 
-STATUS_CHECK_SECONDS = 30
-STATUS_DELETE_SECONDS = 3600
+SCRIPT_DIR = DATA_DIR / "scripts"
+LOG_DIR = DATA_DIR / "logs"
 
-MAX_PYTHON_FILE_SIZE = 10 * 1024 * 1024       # 10 MB
-MAX_REQUIREMENTS_SIZE = 2 * 1024 * 1024      # 2 MB
+SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-BOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# =========================================================
-# LOGGING
-# =========================================================
+MAX_SCRIPT_SIZE = 5 * 1024 * 1024
+MAX_OUTPUT_SIZE = 45000
+LIVE_EDIT_INTERVAL = 1.0
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-logger = logging.getLogger("hosting_manager")
+logger = logging.getLogger("telegram-cmd-panel")
+
 
 # =========================================================
-# STATES
+# SESSION
 # =========================================================
 
-WAITING_PYTHON_FILE = 1
-WAITING_REQUIREMENTS_FILE = 2
-WAITING_TOKEN = 3
-WAITING_BOT_NAME = 4
+@dataclass
+class TerminalSession:
+    chat_id: int
+    file_name: str
+    file_path: Path
+
+    process: Optional[pexpect.spawn] = None
+
+    started_at: float = field(default_factory=time.time)
+    output: str = ""
+
+    live_message_id: Optional[int] = None
+    last_sent_output: str = ""
+
+    running: bool = False
+    waiting_for_input: bool = False
+    stopping: bool = False
+
+    reader_task: Optional[asyncio.Task] = None
+    updater_task: Optional[asyncio.Task] = None
+
+
+active_session: Optional[TerminalSession] = None
+session_lock = asyncio.Lock()
+
 
 # =========================================================
-# RUNTIME MEMORY
+# HELPERS
 # =========================================================
 
-# bot_id -> subprocess.Popen
-RUNNING_PROCESSES = {}
-
-# user_id -> temporary upload data
-USER_SESSIONS = {}
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-
-def get_db():
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_db()
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS hosted_bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            bot_name TEXT NOT NULL,
-            bot_token TEXT NOT NULL,
-            python_file TEXT NOT NULL,
-            requirements_file TEXT,
-            bot_folder TEXT NOT NULL,
-            status TEXT DEFAULT 'stopped',
-            process_id INTEGER DEFAULT 0,
-            status_message_id INTEGER DEFAULT 0,
-            last_status_sent INTEGER DEFAULT 0,
-            last_check INTEGER DEFAULT 0,
-            restart_count INTEGER DEFAULT 0,
-            auto_restart INTEGER DEFAULT 1,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        )
-        """
+def is_admin(update: Update) -> bool:
+    return bool(
+        update.effective_user
+        and update.effective_user.id == ADMIN_ID
     )
 
-    conn.commit()
-    conn.close()
 
-
-def create_hosted_bot(
-    user_id,
-    bot_name,
-    bot_token,
-    python_file,
-    requirements_file,
-    bot_folder,
-):
-    now = int(time.time())
-
-    conn = get_db()
-
-    cursor = conn.execute(
-        """
-        INSERT INTO hosted_bots
-        (
-            user_id,
-            bot_name,
-            bot_token,
-            python_file,
-            requirements_file,
-            bot_folder,
-            status,
-            process_id,
-            status_message_id,
-            last_status_sent,
-            last_check,
-            restart_count,
-            auto_restart,
-            created_at,
-            updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 'stopped', 0, 0, 0, 0, 0, 1, ?, ?)
-        """,
-        (
-            user_id,
-            bot_name,
-            bot_token,
-            python_file,
-            requirements_file,
-            bot_folder,
-            now,
-            now,
-        ),
-    )
-
-    bot_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-
-    return bot_id
-
-
-def get_bot(bot_id):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM hosted_bots WHERE id = ?",
-        (bot_id,),
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def get_user_bots(user_id):
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT * FROM hosted_bots
-        WHERE user_id = ?
-        ORDER BY id DESC
-        """,
-        (user_id,),
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def get_all_active_bots():
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT * FROM hosted_bots
-        WHERE status IN ('running', 'starting')
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def update_bot(bot_id, **fields):
-    if not fields:
-        return
-
-    allowed_fields = {
-        "bot_name",
-        "bot_token",
-        "python_file",
-        "requirements_file",
-        "bot_folder",
-        "status",
-        "process_id",
-        "status_message_id",
-        "last_status_sent",
-        "last_check",
-        "restart_count",
-        "auto_restart",
-        "updated_at",
-    }
-
-    clean_fields = {
-        key: value
-        for key, value in fields.items()
-        if key in allowed_fields
-    }
-
-    if not clean_fields:
-        return
-
-    clean_fields["updated_at"] = int(time.time())
-
-    set_clause = ", ".join(
-        f"{key} = ?" for key in clean_fields.keys()
-    )
-
-    values = list(clean_fields.values())
-    values.append(bot_id)
-
-    conn = get_db()
-    conn.execute(
-        f"UPDATE hosted_bots SET {set_clause} WHERE id = ?",
-        values,
-    )
-    conn.commit()
-    conn.close()
-
-
-def delete_bot_from_db(bot_id):
-    conn = get_db()
-    conn.execute(
-        "DELETE FROM hosted_bots WHERE id = ?",
-        (bot_id,),
-    )
-    conn.commit()
-    conn.close()
-
-
-# =========================================================
-# UTILITY FUNCTIONS
-# =========================================================
-
-
-def now_text():
-    return datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-
-
-def safe_name(value):
-    value = value.strip()
-    value = re.sub(r"[^a-zA-Z0-9_\- ]+", "", value)
-    value = value.replace(" ", "_")
-    return value[:50] or "my_bot"
-
-
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
-
-def get_python_executable(bot_folder):
-    bot_folder = Path(bot_folder)
-
-    if os.name == "nt":
-        return bot_folder / "venv" / "Scripts" / "python.exe"
-
-    return bot_folder / "venv" / "bin" / "python"
-
-
-def get_log_file(bot_folder):
-    return Path(bot_folder) / "bot.log"
-
-
-def mask_token(token):
-    if not token:
-        return "Not Set"
-
-    if len(token) < 12:
-        return "********"
-
-    return token[:5] + "..." + token[-5:]
-
-
-def process_is_running(bot_id):
-    process = RUNNING_PROCESSES.get(bot_id)
-
-    if process is None:
-        bot = get_bot(bot_id)
-
-        if not bot:
-            return False
-
-        process_id = bot["process_id"]
-
-        if not process_id:
-            return False
-
-        try:
-            if os.name == "nt":
-                result = subprocess.run(
-                    [
-                        "tasklist",
-                        "/FI",
-                        f"PID eq {process_id}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-
-                return str(process_id) in result.stdout
-
-            os.kill(process_id, 0)
-            return True
-
-        except Exception:
-            return False
-
-    return process.poll() is None
-
-
-async def safe_delete_message(bot, chat_id, message_id):
-    if not message_id:
-        return
-
-    try:
-        await bot.delete_message(
-            chat_id=chat_id,
-            message_id=message_id,
-        )
-    except Exception:
-        pass
-
-
-# =========================================================
-# REQUIREMENTS INSTALLATION
-# =========================================================
-
-
-def create_virtual_environment(bot_folder):
-    bot_folder = Path(bot_folder)
-    venv_path = bot_folder / "venv"
-
-    if venv_path.exists():
-        return True, "Virtual environment पहले से मौजूद है।"
-
-    try:
-        builder = venv.EnvBuilder(
-            with_pip=True,
-            clear=False,
-            symlinks=False,
-            upgrade=False,
-        )
-        builder.create(str(venv_path))
-        return True, "Virtual environment बन गया।"
-
-    except Exception as error:
-        logger.exception("Venv creation failed")
-        return False, f"Venv बनाने में error: {error}"
-
-
-def install_requirements(bot_folder, requirements_file):
-    if not requirements_file:
-        return True, "requirements.txt नहीं दिया गया।"
-
-    requirements_path = Path(bot_folder) / requirements_file
-
-    if not requirements_path.exists():
-        return False, "requirements.txt फाइल नहीं मिली।"
-
-    python_exe = get_python_executable(bot_folder)
-
-    if not python_exe.exists():
-        return False, "Virtual environment का Python नहीं मिला।"
-
-    try:
-        command = [
-            str(python_exe),
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "pip",
-        ]
-
-        upgrade_result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=600,
+async def reject_user(update: Update):
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "⛔ यह bot केवल admin के लिए है।"
         )
 
-        if upgrade_result.returncode != 0:
-            logger.warning(
-                "pip upgrade warning: %s",
-                upgrade_result.stderr[-2000:],
-            )
 
-        result = subprocess.run(
+def safe_filename(name: str) -> Optional[str]:
+    name = Path(name).name.strip()
+
+    if not name:
+        return None
+
+    if len(name) > 150:
+        return None
+
+    if not name.lower().endswith(".py"):
+        return None
+
+    allowed = (
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
+        "._-"
+    )
+
+    if any(char not in allowed for char in name):
+        return None
+
+    return name
+
+
+def get_file_path(file_name: str) -> Path:
+    return SCRIPT_DIR / file_name
+
+
+def duration_text(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+
+    if minutes:
+        return f"{minutes}m {seconds}s"
+
+    return f"{seconds}s"
+
+
+def output_tail(text: str, limit: int = 3500) -> str:
+    if not text:
+        return "Output की प्रतीक्षा है..."
+
+    if len(text) <= limit:
+        return text
+
+    return (
+        "… पुराना output ऊपर से हटाया गया …\n\n"
+        + text[-limit:]
+    )
+
+
+def main_keyboard():
+    return InlineKeyboardMarkup(
+        [
             [
-                str(python_exe),
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                str(requirements_path),
+                InlineKeyboardButton(
+                    "📂 Files",
+                    callback_data="files",
+                ),
+                InlineKeyboardButton(
+                    "📊 Status",
+                    callback_data="status",
+                ),
             ],
-            capture_output=True,
-            text=True,
-            timeout=1200,
+            [
+                InlineKeyboardButton(
+                    "⌨️ Input Help",
+                    callback_data="input_help",
+                ),
+                InlineKeyboardButton(
+                    "▶️ Run Help",
+                    callback_data="run_help",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "⛔ Stop",
+                    callback_data="stop",
+                ),
+                InlineKeyboardButton(
+                    "🔄 Restart",
+                    callback_data="restart",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "ℹ️ Help",
+                    callback_data="help",
+                ),
+            ],
+        ]
+    )
+
+
+def running_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⌨️ Input Help",
+                    callback_data="input_help",
+                ),
+                InlineKeyboardButton(
+                    "⛔ Stop",
+                    callback_data="stop",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Status",
+                    callback_data="status",
+                ),
+                InlineKeyboardButton(
+                    "🔄 Restart",
+                    callback_data="restart",
+                ),
+            ],
+        ]
+    )
+
+
+# =========================================================
+# RENDER HEALTH SERVER
+# =========================================================
+
+async def health_handler(request):
+    return web.json_response(
+        {
+            "status": "ok",
+            "bot": "running",
+            "script_running": bool(
+                active_session and active_session.running
+            ),
+        }
+    )
+
+
+async def start_health_server(application: Application):
+    health_app = web.Application()
+    health_app.router.add_get("/", health_handler)
+    health_app.router.add_get("/health", health_handler)
+
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT,
+    )
+
+    await site.start()
+
+    application.bot_data["health_runner"] = runner
+
+    logger.info("Health server started on port %s", PORT)
+
+
+async def stop_health_server(application: Application):
+    runner = application.bot_data.get("health_runner")
+
+    if runner:
+        await runner.cleanup()
+
+
+# =========================================================
+# LIVE OUTPUT MESSAGE
+# =========================================================
+
+async def update_live_output(
+    context: ContextTypes.DEFAULT_TYPE,
+    session: TerminalSession,
+    force: bool = False,
+):
+    if not session.live_message_id:
+        return
+
+    visible_output = output_tail(session.output)
+
+    if (
+        not force
+        and visible_output == session.last_sent_output
+    ):
+        return
+
+    if session.running:
+        status = "🟢 RUNNING"
+    else:
+        status = "🔴 FINISHED"
+
+    if session.waiting_for_input:
+        input_status = (
+            "⌨️ <b>Input की प्रतीक्षा है</b>\n"
+            "भेजें: <code>/input आपका_text</code>"
+        )
+    else:
+        input_status = (
+            "⌨️ Input भेजने के लिए "
+            "<code>/input आपका_text</code> लिखें"
         )
 
-        if result.returncode != 0:
-            error_text = result.stderr or result.stdout
-            return False, (
-                "requirements install नहीं हुआ:\n"
-                + error_text[-3000:]
-            )
+    text = (
+        f"🖥️ <b>Python Terminal</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📄 File: <code>{session.file_name}</code>\n"
+        f"📌 Status: <b>{status}</b>\n"
+        f"⏱️ Running: "
+        f"{duration_text(time.time() - session.started_at)}\n"
+        f"{input_status}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<pre>{visible_output}</pre>"
+    )
 
-        return True, "Requirements successfully install हो गए।"
+    if len(text) > 4096:
+        text = (
+            f"🖥️ <b>Python Terminal</b>\n"
+            f"📄 <code>{session.file_name}</code>\n"
+            f"📌 <b>{status}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<pre>{visible_output[-3500:]}</pre>"
+        )
 
-    except subprocess.TimeoutExpired:
-        return False, "Requirements install होने में बहुत समय लग गया।"
+    try:
+        await context.bot.edit_message_text(
+            chat_id=session.chat_id,
+            message_id=session.live_message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=running_keyboard()
+            if session.running
+            else main_keyboard(),
+        )
 
-    except Exception as error:
-        logger.exception("Requirements installation failed")
-        return False, f"Requirements error: {error}"
+        session.last_sent_output = visible_output
+
+    except Exception as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.warning("Live output update failed: %s", exc)
+
+
+async def output_updater(
+    context: ContextTypes.DEFAULT_TYPE,
+    session: TerminalSession,
+):
+    while session.running:
+        await update_live_output(context, session)
+        await asyncio.sleep(LIVE_EDIT_INTERVAL)
+
+    await update_live_output(
+        context,
+        session,
+        force=True,
+    )
 
 
 # =========================================================
-# BOT PROCESS MANAGEMENT
+# INPUT DETECTION
 # =========================================================
 
+def looks_like_input_prompt(output: str) -> bool:
+    """
+    यह केवल संकेत देता है कि script input माँग सकती है।
+    /input command हमेशा काम करेगा, चाहे prompt detect हो या नहीं।
+    """
 
-def stop_bot_process(bot_id):
-    process = RUNNING_PROCESSES.get(bot_id)
+    if not output:
+        return False
 
-    if process:
-        try:
-            if process.poll() is None:
-                process.terminate()
+    last_part = output[-300:].rstrip()
 
+    prompt_endings = (
+        ":",
+        ": ",
+        "?",
+        "? ",
+        ">",
+        "> ",
+        "number",
+        "mobile",
+        "phone",
+        "otp",
+        "password",
+        "code",
+        "enter",
+        "input",
+    )
+
+    lowered = last_part.lower()
+
+    return any(
+        lowered.endswith(item)
+        for item in prompt_endings
+    )
+
+
+# =========================================================
+# SCRIPT READER
+# =========================================================
+
+async def read_script_output(
+    context: ContextTypes.DEFAULT_TYPE,
+    session: TerminalSession,
+):
+    process = session.process
+
+    if not process:
+        return
+
+    log_path = LOG_DIR / (
+        f"{int(session.started_at)}_{session.file_name}.log"
+    )
+
+    try:
+        with log_path.open(
+            "a",
+            encoding="utf-8",
+            errors="replace",
+        ) as log:
+
+            while True:
                 try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                    data = await asyncio.to_thread(
+                        process.read_nonblocking,
+                        4096,
+                        0.25,
+                    )
 
-        except Exception:
-            logger.exception("Process stop error")
+                    if data:
+                        if isinstance(data, bytes):
+                            text = data.decode(
+                                "utf-8",
+                                errors="replace",
+                            )
+                        else:
+                            text = str(data)
 
-        RUNNING_PROCESSES.pop(bot_id, None)
+                        session.output += text
+                        session.output = session.output[
+                            -MAX_OUTPUT_SIZE:
+                        ]
 
-    bot = get_bot(bot_id)
+                        log.write(text)
+                        log.flush()
 
-    if bot and bot["process_id"]:
+                        if looks_like_input_prompt(
+                            session.output
+                        ):
+                            session.waiting_for_input = True
+
+                except pexpect.TIMEOUT:
+                    if not process.isalive():
+                        break
+
+                except pexpect.EOF:
+                    break
+
+                except Exception as exc:
+                    session.output += (
+                        "\n\n❌ READER ERROR:\n"
+                        f"{exc}\n"
+                    )
+                    break
+
+    finally:
+        session.running = False
+        session.waiting_for_input = False
+
         try:
-            if os.name == "nt":
-                subprocess.run(
-                    [
-                        "taskkill",
-                        "/PID",
-                        str(bot["process_id"]),
-                        "/T",
-                        "/F",
-                    ],
-                    capture_output=True,
-                    timeout=10,
+            exit_code = process.exitstatus
+            signal_code = process.signalstatus
+
+            if exit_code == 0:
+                session.output += (
+                    "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ Script successfully finished.\n"
+                    f"Exit code: {exit_code}\n"
                 )
             else:
-                os.kill(bot["process_id"], signal.SIGTERM)
+                session.output += (
+                    "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+                    "❌ Script error के साथ बंद हुई।\n"
+                    f"Exit code: {exit_code}\n"
+                    f"Signal: {signal_code}\n"
+                )
 
+        except Exception:
+            session.output += (
+                "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ Script समाप्त हो गई।\n"
+            )
+
+
+# =========================================================
+# STOP SESSION
+# =========================================================
+
+async def stop_active_session(
+    reason: str = "Admin stopped",
+):
+    global active_session
+
+    session = active_session
+
+    if not session:
+        return False, "अभी कोई script नहीं चल रही है।"
+
+    if session.stopping:
+        return False, "Script पहले से stop हो रही है।"
+
+    session.stopping = True
+    session.running = False
+
+    if session.process:
+        try:
+            if session.process.isalive():
+                session.process.terminate(force=True)
+        except Exception as exc:
+            logger.warning("Stop error: %s", exc)
+
+    session.output += (
+        "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"⛔ {reason}\n"
+    )
+
+    if session.reader_task:
+        try:
+            await asyncio.wait_for(
+                session.reader_task,
+                timeout=4,
+            )
         except Exception:
             pass
 
-    update_bot(
-        bot_id,
-        status="stopped",
-        process_id=0,
-    )
+    active_session = None
 
-
-def start_bot_process(bot_id):
-    bot = get_bot(bot_id)
-
-    if not bot:
-        return False, "Bot database में नहीं मिला।"
-
-    if process_is_running(bot_id):
-        update_bot(bot_id, status="running")
-        return True, "Bot पहले से चल रहा है।"
-
-    bot_folder = Path(bot["bot_folder"])
-    python_file = bot_folder / bot["python_file"]
-
-    if not bot_folder.exists():
-        return False, "Bot folder नहीं मिला।"
-
-    if not python_file.exists():
-        return False, "Python file नहीं मिली।"
-
-    venv_ok, venv_message = create_virtual_environment(bot_folder)
-
-    if not venv_ok:
-        return False, venv_message
-
-    requirements_ok, requirements_message = install_requirements(
-        bot_folder,
-        bot["requirements_file"],
-    )
-
-    if not requirements_ok:
-        return False, requirements_message
-
-    python_exe = get_python_executable(bot_folder)
-
-    if not python_exe.exists():
-        return False, "Virtual environment Python executable नहीं मिला।"
-
-    log_file_path = get_log_file(bot_folder)
-
-    try:
-        log_file = open(
-            log_file_path,
-            "a",
-            encoding="utf-8",
-        )
-
-        log_file.write(
-            "\n\n==============================\n"
-        )
-        log_file.write(
-            f"Bot started at {now_text()}\n"
-        )
-        log_file.write(
-            "==============================\n"
-        )
-        log_file.flush()
-
-        environment = os.environ.copy()
-
-        # Uploaded bot को उसका token environment variable में मिलेगा
-        environment["BOT_TOKEN"] = bot["bot_token"]
-        environment["TELEGRAM_BOT_TOKEN"] = bot["bot_token"]
-
-        process = subprocess.Popen(
-            [
-                str(python_exe),
-                str(python_file),
-            ],
-            cwd=str(bot_folder),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP
-                if os.name == "nt"
-                else 0
-            ),
-        )
-
-        RUNNING_PROCESSES[bot_id] = process
-
-        update_bot(
-            bot_id,
-            status="running",
-            process_id=process.pid,
-        )
-
-        return True, (
-            "Bot successfully start हो गया।\n"
-            f"PID: {process.pid}\n"
-            f"Log: {log_file_path}"
-        )
-
-    except Exception as error:
-        logger.exception("Bot start failed")
-        update_bot(
-            bot_id,
-            status="error",
-            process_id=0,
-        )
-        return False, f"Bot start error: {error}"
+    return True, "Script stop कर दी गई।"
 
 
 # =========================================================
-# STATUS MESSAGE
+# RUN SCRIPT
 # =========================================================
 
+async def run_script(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_name: str,
+):
+    global active_session
 
-def make_status_text(bot):
-    bot_id = bot["id"]
-    running = process_is_running(bot_id)
+    file_name = safe_filename(file_name)
 
-    if running:
-        status_icon = "🟢"
-        status_text = "Running"
-    else:
-        status_icon = "🔴"
-        status_text = "Stopped"
-
-    process_id = bot["process_id"] or "N/A"
-
-    return (
-        f"{status_icon} <b>आपके Bot का Status</b>\n\n"
-        f"🤖 <b>Bot Name:</b> {bot['bot_name']}\n"
-        f"🆔 <b>Bot ID:</b> {bot_id}\n"
-        f"📊 <b>Status:</b> {status_text}\n"
-        f"⚙️ <b>Process ID:</b> {process_id}\n"
-        f"🔄 <b>Auto Restart:</b> "
-        f"{'Enabled' if bot['auto_restart'] else 'Disabled'}\n"
-        f"🔁 <b>Restart Count:</b> {bot['restart_count']}\n"
-        f"🕒 <b>Last Check:</b> {now_text()}\n\n"
-        "ℹ️ यह status हर 30 सेकंड में check होता है।\n"
-        "🗑️ यह status message 1 घंटे बाद अपने आप delete हो जाएगा।"
-    )
-
-
-async def send_new_status_message(application, bot_id):
-    bot_record = get_bot(bot_id)
-
-    if not bot_record:
+    if not file_name:
+        await update.effective_message.reply_text(
+            "❌ सही `.py` filename दें।\n\n"
+            "उदाहरण:\n"
+            "`/run test.py`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
-    user_id = bot_record["user_id"]
-    old_message_id = bot_record["status_message_id"]
+    file_path = get_file_path(file_name)
 
-    await safe_delete_message(
-        application.bot,
-        user_id,
-        old_message_id,
-    )
-
-    fresh_bot = get_bot(bot_id)
-
-    if not fresh_bot:
+    if not file_path.exists():
+        await update.effective_message.reply_text(
+            f"❌ File नहीं मिली:\n`{file_name}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
-    text = make_status_text(fresh_bot)
+    async with session_lock:
+        if active_session and active_session.running:
+            await update.effective_message.reply_text(
+                "⚠️ अभी एक script चल रही है।\n"
+                "पहले `/stop` करें।"
+            )
+            return
+
+        session = TerminalSession(
+            chat_id=update.effective_chat.id,
+            file_name=file_name,
+            file_path=file_path,
+        )
+
+        active_session = session
 
     try:
-        message = await application.bot.send_message(
-            chat_id=user_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
+        process = pexpect.spawn(
+            sys.executable,
+            ["-u", str(file_path)],
+            cwd=str(SCRIPT_DIR),
+            encoding=None,
+            echo=True,
+            timeout=0.25,
         )
 
-        update_bot(
-            bot_id,
-            status_message_id=message.message_id,
-            last_status_sent=int(time.time()),
+        session.process = process
+        session.running = True
+
+        live_message = await update.effective_message.reply_text(
+            f"🚀 Script शुरू हो गई:\n"
+            f"📄 `{file_name}`\n\n"
+            f"यदि script number या OTP माँगे तो भेजें:\n"
+            f"`/input आपका_text`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=running_keyboard(),
         )
 
-        # 1 घंटे बाद इस message को delete करेगा
-        application.job_queue.run_once(
-            delete_status_job,
-            when=STATUS_DELETE_SECONDS,
-            data={
-                "chat_id": user_id,
-                "message_id": message.message_id,
-                "bot_id": bot_id,
-            },
-        )
+        session.live_message_id = live_message.message_id
 
-    except Exception as error:
-        logger.warning(
-            "Status message send failed for bot %s: %s",
-            bot_id,
-            error,
-        )
-
-
-async def delete_status_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-
-    await safe_delete_message(
-        context.bot,
-        data["chat_id"],
-        data["message_id"],
-    )
-
-    bot_id = data.get("bot_id")
-
-    if bot_id:
-        bot_record = get_bot(bot_id)
-
-        if bot_record and bot_record["status_message_id"] == data["message_id"]:
-            update_bot(
-                bot_id,
-                status_message_id=0,
+        session.reader_task = asyncio.create_task(
+            read_script_output(
+                context,
+                session,
             )
+        )
 
-
-# =========================================================
-# PERIODIC HEALTH CHECK
-# =========================================================
-
-
-async def health_check_job(context: ContextTypes.DEFAULT_TYPE):
-    application = context.application
-
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT * FROM hosted_bots
-        WHERE status IN ('running', 'starting', 'error')
-        ORDER BY id ASC
-        """
-    ).fetchall()
-    conn.close()
-
-    for bot in rows:
-        bot_id = bot["id"]
-
-        try:
-            running = process_is_running(bot_id)
-
-            if running:
-                update_bot(
-                    bot_id,
-                    status="running",
-                    last_check=int(time.time()),
-                )
-
-            else:
-                update_bot(
-                    bot_id,
-                    status="stopped",
-                    last_check=int(time.time()),
-                )
-
-                if bot["auto_restart"]:
-                    current_bot = get_bot(bot_id)
-                    restart_count = current_bot["restart_count"] + 1
-
-                    update_bot(
-                        bot_id,
-                        status="starting",
-                        restart_count=restart_count,
-                    )
-
-                    success, message = start_bot_process(bot_id)
-
-                    logger.info(
-                        "Auto restart bot %s: %s - %s",
-                        bot_id,
-                        success,
-                        message,
-                    )
-
-            # हर 30 सेकंड में user को status भेजना
-            await send_new_status_message(
-                application,
-                bot_id,
+        session.updater_task = asyncio.create_task(
+            output_updater(
+                context,
+                session,
             )
+        )
 
-        except Exception:
-            logger.exception(
-                "Health check failed for bot %s",
-                bot_id,
-            )
+        await session.reader_task
+
+        if session.updater_task:
+            try:
+                await session.updater_task
+            except Exception:
+                pass
+
+        await update_live_output(
+            context,
+            session,
+            force=True,
+        )
+
+        await update.effective_message.reply_text(
+            f"🏁 Script समाप्त हो गई:\n"
+            f"`{file_name}`\n\n"
+            f"ऊपर अंतिम output और error देखें।",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as exc:
+        logger.exception("Script run error")
+
+        session.running = False
+        session.output += (
+            "\n\n❌ SCRIPT START ERROR:\n"
+            f"{exc}\n"
+        )
+
+        await update.effective_message.reply_text(
+            f"❌ Script शुरू नहीं हो सकी:\n"
+            f"`{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    finally:
+        if active_session is session:
+            active_session = None
 
 
 # =========================================================
 # COMMANDS
 # =========================================================
 
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    text = (
-        "👋 <b>Python Hosting Manager में आपका स्वागत है।</b>\n\n"
-        "इस Bot से आप अपनी Python Telegram Bot file चला सकते हैं।\n\n"
-        "📤 /upload - नई Python Bot upload करें\n"
-        "📋 /mybots - अपनी Bots देखें\n"
-        "▶️ /startbot BOT_ID - Bot start करें\n"
-        "⏹️ /stopbot BOT_ID - Bot stop करें\n"
-        "🔄 /restartbot BOT_ID - Bot restart करें\n"
-        "🗑️ /deletebot BOT_ID - Bot delete करें\n"
-        "📄 /logs BOT_ID - Bot log की जानकारी\n"
-        "❓ /help - Help\n\n"
-        "⚠️ Bot Token किसी अन्य व्यक्ति को न भेजें।"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📚 <b>Commands Help</b>\n\n"
-        "/upload - नई Bot upload करें\n"
-        "/mybots - अपनी सभी Bots देखें\n"
-        "/startbot 1 - Bot ID 1 को start करें\n"
-        "/stopbot 1 - Bot ID 1 को stop करें\n"
-        "/restartbot 1 - Bot ID 1 को restart करें\n"
-        "/deletebot 1 - Bot ID 1 को delete करें\n"
-        "/logs 1 - Bot की log file देखें\n\n"
-        "हर 30 सेकंड में Manager Bot आपके Bot का status check करता है।\n"
-        "Status message 1 घंटे बाद अपने आप delete हो जाता है।"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def mybots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    bots = get_user_bots(user_id)
-
-    if not bots:
-        await update.message.reply_text(
-            "आपने अभी तक कोई Bot upload नहीं किया है।\n/upload दबाएँ।"
-        )
-        return
-
-    lines = ["📋 <b>आपकी Bots</b>\n"]
-
-    for bot in bots:
-        running = process_is_running(bot["id"])
-        status = "🟢 Running" if running else "🔴 Stopped"
-
-        lines.append(
-            f"🆔 <b>ID:</b> {bot['id']}\n"
-            f"🤖 <b>Name:</b> {bot['bot_name']}\n"
-            f"📊 <b>Status:</b> {status}\n"
-            f"🔁 <b>Restarts:</b> {bot['restart_count']}\n"
-        )
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    USER_SESSIONS[user_id] = {
-        "python_file": None,
-        "requirements_file": None,
-        "bot_token": None,
-        "bot_name": None,
-    }
-
-    await update.message.reply_text(
-        "📤 अपनी Python file भेजें।\n\n"
-        "उदाहरण: `mybot.py`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    return WAITING_PYTHON_FILE
-
-
-async def receive_python_file(
+async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user_id = update.effective_user.id
-    document = update.message.document
+    if not is_admin(update):
+        await reject_user(update)
+        return
 
-    if not document:
-        await update.message.reply_text(
-            "कृपया केवल `.py` file भेजें।"
+    await update.message.reply_text(
+        "🖥️ <b>Python CMD Panel</b>\n\n"
+        "यह bot आपकी Python script को Telegram से चलाता है।\n\n"
+        "📂 Python file upload करें\n"
+        "▶️ `/run filename.py`\n"
+        "⌨️ `/input number_or_otp`\n"
+        "⛔ `/stop`\n"
+        "🔄 `/restart`\n"
+        "📊 `/status`\n"
+        "📁 `/files`\n"
+        "🗑️ `/delete filename.py`\n"
+        "ℹ️ `/help`",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    await update.message.reply_text(
+        "ℹ️ <b>पूरा उपयोग तरीका</b>\n\n"
+        "1. अपनी Python file Document के रूप में upload करें।\n"
+        "2. `/files` से filename देखें।\n"
+        "3. `/run filename.py` भेजें।\n"
+        "4. Script number माँगे तो:\n"
+        "`/input 9876543210`\n"
+        "5. Script OTP माँगे तो:\n"
+        "`/input 123456`\n"
+        "6. Script का output live message में दिखेगा।\n"
+        "7. Error होने पर traceback और exit code दिखेगा।\n\n"
+        "Commands:\n"
+        "/files\n"
+        "/run filename.py\n"
+        "/input text\n"
+        "/status\n"
+        "/stop\n"
+        "/restart\n"
+        "/delete filename.py\n\n"
+        "⚠️ OTP और password Telegram chat history में दिखाई दे सकते हैं।",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def files_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    files = sorted(
+        [
+            item.name
+            for item in SCRIPT_DIR.iterdir()
+            if item.is_file()
+            and item.suffix.lower() == ".py"
+        ]
+    )
+
+    if not files:
+        await update.effective_message.reply_text(
+            "📂 अभी कोई Python file upload नहीं है।"
         )
-        return WAITING_PYTHON_FILE
+        return
 
-    file_name = document.file_name or ""
+    text = "📂 <b>Python Files</b>\n\n"
 
-    if not file_name.lower().endswith(".py"):
-        await update.message.reply_text(
-            "❌ केवल `.py` file स्वीकार की जाती है।"
+    for number, file_name in enumerate(files, start=1):
+        text += f"{number}. <code>{file_name}</code>\n"
+
+    text += (
+        "\n▶️ Run करने के लिए:\n"
+        "<code>/run filename.py</code>"
+    )
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    session = active_session
+
+    if not session or not session.running:
+        await update.effective_message.reply_text(
+            "🔴 कोई script नहीं चल रही है।",
+            reply_markup=main_keyboard(),
         )
-        return WAITING_PYTHON_FILE
+        return
 
-    if document.file_size and document.file_size > MAX_PYTHON_FILE_SIZE:
-        await update.message.reply_text(
-            "❌ Python file बहुत बड़ी है। अधिकतम सीमा 10 MB है।"
+    await update.effective_message.reply_text(
+        f"🟢 <b>Script Running</b>\n\n"
+        f"📄 File: <code>{session.file_name}</code>\n"
+        f"⏱️ Time: "
+        f"{duration_text(time.time() - session.started_at)}\n"
+        f"⌨️ Input detected: "
+        f"{'हाँ' if session.waiting_for_input else 'नहीं'}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=running_keyboard(),
+    )
+
+
+async def input_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    session = active_session
+
+    if not session or not session.running:
+        await update.effective_message.reply_text(
+            "⚠️ अभी कोई script नहीं चल रही है।"
         )
-        return WAITING_PYTHON_FILE
+        return
 
-    session = USER_SESSIONS.get(user_id)
+    if not session.process:
+        await update.effective_message.reply_text(
+            "❌ Process उपलब्ध नहीं है।"
+        )
+        return
+
+    input_text = update.message.text.partition(" ")[2]
+
+    if not input_text:
+        await update.message.reply_text(
+            "उदाहरण:\n"
+            "`/input 9876543210`\n\n"
+            "या:\n"
+            "`/input 123456`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        session.process.sendline(input_text)
+        session.waiting_for_input = False
+
+        await update.message.reply_text(
+            "⌨️ Input script को भेज दिया गया।"
+        )
+
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Input भेजने में error:\n`{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def stop_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    success, message = await stop_active_session(
+        "Admin ने script stop की"
+    )
+
+    await update.message.reply_text(
+        ("✅ " if success else "ℹ️ ") + message,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def restart_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    session = active_session
 
     if not session:
         await update.message.reply_text(
-            "Session समाप्त हो गया। फिर से /upload करें।"
+            "⚠️ Restart करने के लिए active script नहीं है।"
         )
-        return ConversationHandler.END
+        return
 
-    session["python_file"] = file_name
-    session["python_file_id"] = document.file_id
+    file_name = session.file_name
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📄 requirements.txt भेजूँगा",
-                callback_data="requirements_yes",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⏭️ requirements.txt नहीं है",
-                callback_data="requirements_no",
-            )
-        ],
-    ]
+    await stop_active_session("Restart requested")
+    await asyncio.sleep(0.5)
 
-    await update.message.reply_text(
-        "✅ Python file मिल गई।\n\n"
-        "क्या आपके पास `requirements.txt` है?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN,
+    await run_script(
+        update,
+        context,
+        file_name,
     )
 
-    return WAITING_REQUIREMENTS_FILE
+
+async def delete_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "उदाहरण:\n`/delete test.py`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    file_name = safe_filename(context.args[0])
+
+    if not file_name:
+        await update.message.reply_text(
+            "❌ Invalid filename."
+        )
+        return
+
+    if active_session and active_session.file_name == file_name:
+        await update.message.reply_text(
+            "⛔ यह file अभी चल रही है। पहले `/stop` करें।"
+        )
+        return
+
+    file_path = get_file_path(file_name)
+
+    if not file_path.exists():
+        await update.message.reply_text(
+            "❌ File नहीं मिली।"
+        )
+        return
+
+    try:
+        file_path.unlink()
+
+        await update.message.reply_text(
+            f"🗑️ File delete हो गई:\n`{file_name}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Delete error:\n`{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
-async def requirements_callback(
+# =========================================================
+# DOCUMENT UPLOAD
+# =========================================================
+
+async def document_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    document = update.message.document
+
+    if not document:
+        return
+
+    file_name = safe_filename(
+        document.file_name or ""
+    )
+
+    if not file_name:
+        await update.message.reply_text(
+            "❌ केवल `.py` file upload करें।"
+        )
+        return
+
+    if (
+        document.file_size
+        and document.file_size > MAX_SCRIPT_SIZE
+    ):
+        await update.message.reply_text(
+            "❌ File 5 MB से बड़ी है।"
+        )
+        return
+
+    destination = get_file_path(file_name)
+
+    try:
+        telegram_file = await context.bot.get_file(
+            document.file_id
+        )
+
+        await telegram_file.download_to_drive(
+            custom_path=str(destination)
+        )
+
+        await update.message.reply_text(
+            f"✅ File upload हो गई:\n"
+            f"`{file_name}`\n\n"
+            f"चलाने के लिए:\n"
+            f"`/run {file_name}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as exc:
+        logger.exception("Upload error")
+
+        await update.message.reply_text(
+            f"❌ Upload error:\n`{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# =========================================================
+# BUTTONS
+# =========================================================
+
+async def callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
-    session = USER_SESSIONS.get(user_id)
-
-    if not session:
+    if query.from_user.id != ADMIN_ID:
         await query.edit_message_text(
-            "Session समाप्त हो गया। फिर से /upload करें।"
-        )
-        return ConversationHandler.END
-
-    if query.data == "requirements_no":
-        session["requirements_file"] = None
-
-        await query.edit_message_text(
-            "ठीक है। अब अपना Bot Token भेजें।\n\n"
-            "BotFather से मिला हुआ token भेजें।"
-        )
-
-        return WAITING_TOKEN
-
-    session["waiting_requirements"] = True
-
-    await query.edit_message_text(
-        "अब अपनी `requirements.txt` file भेजें।",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    return WAITING_REQUIREMENTS_FILE
-
-
-async def receive_requirements_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    document = update.message.document
-
-    if not document:
-        await update.message.reply_text(
-            "कृपया `requirements.txt` file भेजें।"
-        )
-        return WAITING_REQUIREMENTS_FILE
-
-    file_name = document.file_name or ""
-
-    if file_name.lower() != "requirements.txt":
-        await update.message.reply_text(
-            "❌ File का नाम बिल्कुल `requirements.txt` होना चाहिए।"
-        )
-        return WAITING_REQUIREMENTS_FILE
-
-    if document.file_size and document.file_size > MAX_REQUIREMENTS_SIZE:
-        await update.message.reply_text(
-            "❌ requirements.txt बहुत बड़ी है।"
-        )
-        return WAITING_REQUIREMENTS_FILE
-
-    session = USER_SESSIONS.get(user_id)
-
-    if not session:
-        await update.message.reply_text(
-            "Session समाप्त हो गया। फिर से /upload करें।"
-        )
-        return ConversationHandler.END
-
-    session["requirements_file"] = file_name
-    session["requirements_file_id"] = document.file_id
-
-    await update.message.reply_text(
-        "✅ requirements.txt मिल गई।\n\n"
-        "अब अपना Bot Token भेजें।"
-    )
-
-    return WAITING_TOKEN
-
-
-async def receive_token(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    token = update.message.text.strip()
-
-    session = USER_SESSIONS.get(user_id)
-
-    if not session:
-        await update.message.reply_text(
-            "Session समाप्त हो गया। फिर से /upload करें।"
-        )
-        return ConversationHandler.END
-
-    if not re.match(r"^\d+:[A-Za-z0-9_-]{20,}$", token):
-        await update.message.reply_text(
-            "❌ Token का format सही नहीं लग रहा है।\n"
-            "BotFather से मिला पूरा token भेजें।"
-        )
-        return WAITING_TOKEN
-
-    session["bot_token"] = token
-
-    await update.message.reply_text(
-        "अब अपने Bot का नाम भेजें।\n\n"
-        "उदाहरण: Study Bot"
-    )
-
-    return WAITING_BOT_NAME
-
-
-async def receive_bot_name(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    bot_name = safe_name(update.message.text)
-
-    session = USER_SESSIONS.get(user_id)
-
-    if not session:
-        await update.message.reply_text(
-            "Session समाप्त हो गया। फिर से /upload करें।"
-        )
-        return ConversationHandler.END
-
-    session["bot_name"] = bot_name
-
-    await update.message.reply_text(
-        "⏳ आपकी files तैयार की जा रही हैं..."
-    )
-
-    try:
-        bot_folder_name = (
-            f"user_{user_id}_"
-            f"{int(time.time())}_"
-            f"{safe_name(bot_name)}"
-        )
-
-        bot_folder = BOTS_DIR / bot_folder_name
-        bot_folder.mkdir(parents=True, exist_ok=True)
-
-        telegram_file = await context.bot.get_file(
-            session["python_file_id"]
-        )
-
-        python_file_path = bot_folder / session["python_file"]
-
-        await telegram_file.download_to_drive(
-            custom_path=str(python_file_path)
-        )
-
-        requirements_file_name = session.get("requirements_file")
-
-        if requirements_file_name:
-            requirements_telegram_file = await context.bot.get_file(
-                session["requirements_file_id"]
-            )
-
-            requirements_path = bot_folder / requirements_file_name
-
-            await requirements_telegram_file.download_to_drive(
-                custom_path=str(requirements_path)
-            )
-
-        bot_id = create_hosted_bot(
-            user_id=user_id,
-            bot_name=bot_name,
-            bot_token=session["bot_token"],
-            python_file=session["python_file"],
-            requirements_file=requirements_file_name,
-            bot_folder=str(bot_folder),
-        )
-
-        success, message = start_bot_process(bot_id)
-
-        if success:
-            status_text = (
-                "🟢 <b>आपका Bot शुरू हो गया है।</b>\n\n"
-                f"🆔 Bot ID: <code>{bot_id}</code>\n"
-                f"🤖 Name: <b>{bot_name}</b>\n\n"
-                "🔄 Manager हर 30 सेकंड में status check करेगा।\n"
-                "🗑️ Status message 1 घंटे बाद delete होगा।\n\n"
-                "Commands:\n"
-                f"/stopbot {bot_id}\n"
-                f"/restartbot {bot_id}\n"
-                f"/logs {bot_id}"
-            )
-        else:
-            status_text = (
-                "⚠️ Bot save हो गया, लेकिन start नहीं हो पाया।\n\n"
-                f"🆔 Bot ID: {bot_id}\n"
-                f"❌ Error:\n{message}\n\n"
-                f"/restartbot {bot_id}\n"
-                f"/logs {bot_id}"
-            )
-
-        await update.message.reply_text(
-            status_text,
-            parse_mode=ParseMode.HTML,
-        )
-
-        USER_SESSIONS.pop(user_id, None)
-
-        return ConversationHandler.END
-
-    except Exception as error:
-        logger.exception("Upload failed")
-
-        await update.message.reply_text(
-            "❌ Upload करते समय error आया:\n\n"
-            f"{error}"
-        )
-
-        return ConversationHandler.END
-
-
-async def cancel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    USER_SESSIONS.pop(user_id, None)
-
-    await update.message.reply_text(
-        "❌ Upload process cancel कर दिया गया।"
-    )
-
-    return ConversationHandler.END
-
-
-# =========================================================
-# BOT CONTROL COMMANDS
-# =========================================================
-
-
-def parse_bot_id(context):
-    if not context.args:
-        return None
-
-    try:
-        return int(context.args[0])
-    except ValueError:
-        return None
-
-
-def user_owns_bot(user_id, bot_id):
-    bot = get_bot(bot_id)
-
-    if not bot:
-        return False, None
-
-    if bot["user_id"] != user_id and not is_admin(user_id):
-        return False, bot
-
-    return True, bot
-
-
-async def startbot_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    bot_id = parse_bot_id(context)
-
-    if not bot_id:
-        await update.message.reply_text(
-            "उपयोग: /startbot BOT_ID"
+            "⛔ केवल admin access कर सकता है।"
         )
         return
 
-    allowed, bot = user_owns_bot(user_id, bot_id)
+    action = query.data
 
-    if not allowed:
-        await update.message.reply_text(
-            "❌ यह Bot ID आपकी नहीं है या मौजूद नहीं है।"
-        )
-        return
+    if action == "files":
+        await files_command(update, context)
 
-    success, message = start_bot_process(bot_id)
+    elif action == "status":
+        await status_command(update, context)
 
-    await update.message.reply_text(
-        ("🟢 " if success else "❌ ") + message
-    )
-
-
-async def stopbot_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    bot_id = parse_bot_id(context)
-
-    if not bot_id:
-        await update.message.reply_text(
-            "उपयोग: /stopbot BOT_ID"
-        )
-        return
-
-    allowed, bot = user_owns_bot(user_id, bot_id)
-
-    if not allowed:
-        await update.message.reply_text(
-            "❌ यह Bot ID आपकी नहीं है या मौजूद नहीं है।"
-        )
-        return
-
-    stop_bot_process(bot_id)
-
-    await update.message.reply_text(
-        f"⏹️ Bot {bot_id} बंद कर दिया गया है।"
-    )
-
-
-async def restartbot_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    bot_id = parse_bot_id(context)
-
-    if not bot_id:
-        await update.message.reply_text(
-            "उपयोग: /restartbot BOT_ID"
-        )
-        return
-
-    allowed, bot = user_owns_bot(user_id, bot_id)
-
-    if not allowed:
-        await update.message.reply_text(
-            "❌ यह Bot ID आपकी नहीं है या मौजूद नहीं है।"
-        )
-        return
-
-    stop_bot_process(bot_id)
-    await asyncio.sleep(2)
-
-    success, message = start_bot_process(bot_id)
-
-    await update.message.reply_text(
-        ("🔄 " if success else "❌ ") + message
-    )
-
-
-async def deletebot_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    bot_id = parse_bot_id(context)
-
-    if not bot_id:
-        await update.message.reply_text(
-            "उपयोग: /deletebot BOT_ID"
-        )
-        return
-
-    allowed, bot = user_owns_bot(user_id, bot_id)
-
-    if not allowed:
-        await update.message.reply_text(
-            "❌ यह Bot ID आपकी नहीं है या मौजूद नहीं है।"
-        )
-        return
-
-    stop_bot_process(bot_id)
-
-    try:
-        folder = Path(bot["bot_folder"])
-
-        if folder.exists():
-            shutil.rmtree(folder, ignore_errors=True)
-
-    except Exception:
-        logger.exception("Folder delete failed")
-
-    delete_bot_from_db(bot_id)
-
-    await update.message.reply_text(
-        f"🗑️ Bot {bot_id} और उसकी files delete कर दी गई हैं।"
-    )
-
-
-async def logs_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    user_id = update.effective_user.id
-    bot_id = parse_bot_id(context)
-
-    if not bot_id:
-        await update.message.reply_text(
-            "उपयोग: /logs BOT_ID"
-        )
-        return
-
-    allowed, bot = user_owns_bot(user_id, bot_id)
-
-    if not allowed:
-        await update.message.reply_text(
-            "❌ यह Bot ID आपकी नहीं है या मौजूद नहीं है।"
-        )
-        return
-
-    log_path = get_log_file(bot["bot_folder"])
-
-    if not log_path.exists():
-        await update.message.reply_text(
-            "अभी log file नहीं बनी है।"
-        )
-        return
-
-    try:
-        content = log_path.read_text(
-            encoding="utf-8",
-            errors="replace",
+    elif action == "stop":
+        success, message = await stop_active_session(
+            "Admin ने button से stop किया"
         )
 
-        if len(content) > 3500:
-            content = content[-3500:]
-
-        await update.message.reply_text(
-            "📄 <b>Last Bot Logs:</b>\n\n"
-            f"<pre>{content}</pre>",
-            parse_mode=ParseMode.HTML,
+        await query.message.reply_text(
+            ("✅ " if success else "ℹ️ ") + message,
+            reply_markup=main_keyboard(),
         )
 
-    except Exception as error:
-        await update.message.reply_text(
-            f"Log पढ़ने में error: {error}"
+    elif action == "restart":
+        await restart_command(update, context)
+
+    elif action == "help":
+        await help_command(update, context)
+
+    elif action == "run_help":
+        await query.message.reply_text(
+            "▶️ Script चलाने का तरीका:\n\n"
+            "`/run filename.py`\n\n"
+            "उदाहरण:\n"
+            "`/run login.py`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    elif action == "input_help":
+        await query.message.reply_text(
+            "⌨️ बार-बार input देने के लिए:\n\n"
+            "पहला number:\n"
+            "`/input 9876543210`\n\n"
+            "फिर OTP:\n"
+            "`/input 123456`\n\n"
+            "फिर अगला input:\n"
+            "`/input अपना_text`",
+            parse_mode=ParseMode.MARKDOWN,
         )
 
 
 # =========================================================
-# ADMIN COMMANDS
+# ERROR HANDLER
 # =========================================================
 
-
-async def admin_bots_command(
-    update: Update,
+async def error_handler(
+    update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "❌ केवल Admin के लिए।"
-        )
-        return
-
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM hosted_bots ORDER BY id DESC"
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text(
-            "अभी कोई hosted Bot नहीं है।"
-        )
-        return
-
-    lines = ["👑 <b>All Hosted Bots</b>\n"]
-
-    for bot in rows:
-        status = (
-            "🟢 Running"
-            if process_is_running(bot["id"])
-            else "🔴 Stopped"
-        )
-
-        lines.append(
-            f"🆔 {bot['id']} | "
-            f"User: {bot['user_id']}\n"
-            f"🤖 {bot['bot_name']} | {status}\n"
-        )
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
+    logger.exception(
+        "Unhandled bot error",
+        exc_info=context.error,
     )
-
-
-async def admin_stop_all_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "❌ केवल Admin के लिए।"
-        )
-        return
-
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id FROM hosted_bots"
-    ).fetchall()
-    conn.close()
-
-    count = 0
-
-    for row in rows:
-        stop_bot_process(row["id"])
-        count += 1
-
-    await update.message.reply_text(
-        f"⏹️ {count} Bots बंद कर दिए गए हैं।"
-    )
-
-
-# =========================================================
-# STARTUP RESTORE
-# =========================================================
-
-
-async def restore_active_bots(application):
-    bots = get_all_active_bots()
-
-    if not bots:
-        logger.info("Restore करने के लिए कोई active Bot नहीं है।")
-        return
-
-    logger.info(
-        "Restoring %s active bots...",
-        len(bots),
-    )
-
-    for bot in bots:
-        try:
-            update_bot(
-                bot["id"],
-                status="starting",
-            )
-
-            success, message = start_bot_process(bot["id"])
-
-            logger.info(
-                "Restore bot %s: %s - %s",
-                bot["id"],
-                success,
-                message,
-            )
-
-        except Exception:
-            logger.exception(
-                "Restore failed for bot %s",
-                bot["id"],
-            )
-
-
-async def post_init(application):
-    init_db()
-
-    await restore_active_bots(application)
-
-    # हर 30 सेकंड में health check
-    application.job_queue.run_repeating(
-        health_check_job,
-        interval=STATUS_CHECK_SECONDS,
-        first=10,
-        name="health_check",
-    )
-
-    logger.info("Health check job started.")
 
 
 # =========================================================
 # MAIN
 # =========================================================
 
-
 def main():
-    if MANAGER_BOT_TOKEN == "YAHAN_MANAGER_BOT_TOKEN_DALEIN":
-        print(
-            "ERROR: MANAGER_BOT_TOKEN में अपना Manager Bot token डालें।"
-        )
-        return
-
-    if ADMIN_ID == 123456789:
-        print(
-            "WARNING: ADMIN_ID में अपना Telegram numeric ID डालें।"
-        )
-
     application = (
         Application.builder()
-        .token(MANAGER_BOT_TOKEN)
-        .post_init(post_init)
+        .token(BOT_TOKEN)
+        .post_init(start_health_server)
+        .post_shutdown(stop_health_server)
         .build()
     )
 
-    upload_conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("upload", upload_command),
-        ],
-        states={
-            WAITING_PYTHON_FILE: [
-                MessageHandler(
-                    filters.Document.ALL,
-                    receive_python_file,
-                ),
-            ],
-            WAITING_REQUIREMENTS_FILE: [
-                CallbackQueryHandler(
-                    requirements_callback,
-                    pattern="^requirements_(yes|no)$",
-                ),
-                MessageHandler(
-                    filters.Document.ALL,
-                    receive_requirements_file,
-                ),
-            ],
-            WAITING_TOKEN: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    receive_token,
-                ),
-            ],
-            WAITING_BOT_NAME: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    receive_bot_name,
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel_command),
-        ],
-        allow_reentry=True,
-    )
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("mybots", mybots_command))
-
-    application.add_handler(upload_conversation)
-
     application.add_handler(
-        CommandHandler("startbot", startbot_command)
-    )
-    application.add_handler(
-        CommandHandler("stopbot", stopbot_command)
-    )
-    application.add_handler(
-        CommandHandler("restartbot", restartbot_command)
-    )
-    application.add_handler(
-        CommandHandler("deletebot", deletebot_command)
-    )
-    application.add_handler(
-        CommandHandler("logs", logs_command)
+        CommandHandler("start", start_command)
     )
 
     application.add_handler(
-        CommandHandler("adminbots", admin_bots_command)
-    )
-    application.add_handler(
-        CommandHandler("stopall", admin_stop_all_command)
+        CommandHandler("help", help_command)
     )
 
-    logger.info("Hosting Manager Bot starting...")
+    application.add_handler(
+        CommandHandler("files", files_command)
+    )
+
+    application.add_handler(
+        CommandHandler("status", status_command)
+    )
+
+    application.add_handler(
+        CommandHandler("run", run_script_command)
+    )
+
+    application.add_handler(
+        CommandHandler("input", input_command)
+    )
+
+    application.add_handler(
+        CommandHandler("stop", stop_command)
+    )
+
+    application.add_handler(
+        CommandHandler("restart", restart_command)
+    )
+
+    application.add_handler(
+        CommandHandler("delete", delete_command)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Document.ALL,
+            document_handler,
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(callback_handler)
+    )
+
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot starting...")
     application.run_polling(
-        drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
+
+async def run_script_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not is_admin(update):
+        await reject_user(update)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "उदाहरण:\n`/run test.py`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await run_script(
+        update,
+        context,
+        context.args[0],
     )
 
 
