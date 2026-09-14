@@ -30,8 +30,8 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_TEXT = os.getenv("ADMIN_ID", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8400765415:AAEHYxy2k8xBdr2nvy8Y0H894C3__bBfKM0").strip()
+ADMIN_ID_TEXT = os.getenv("ADMIN_ID", "8209524871").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
